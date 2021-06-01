@@ -1,11 +1,13 @@
 import { promises as fsp } from 'fs'
 import * as path from 'path'
+import _debounce from 'lodash.debounce'
 import { client } from './hyperspace.js'
 import Hyperbee from 'hyperbee'
 import * as hyperspace from './hyperspace.js'
 import { PublicServerDB, PrivateServerDB } from './server.js'
 import { PublicCitizenDB, PrivateCitizenDB } from './citizen.js'
 import { PublicCommunityDB } from './community.js'
+import * as diskusageTracker from './diskusage-tracker.js'
 import * as schemas from '../lib/schemas.js'
 import * as views from './views.js'
 import { RESERVED_USERNAMES, HYPER_KEY, hyperUrlToKey, constructUserId, getDomain, getServerIdForUserId } from '../lib/strings.js'
@@ -18,6 +20,8 @@ import { LoadExternalUserDbIssue } from '../lib/issues/load-external-user-db.js'
 import { UnknownUserTypeIssue } from '../lib/issues/unknown-user-type.js'
 import lock from '../lib/lock.js'
 
+const SWEEP_INACTIVE_DBS_INTERVAL = 10e3
+
 let _configDir = undefined
 export let configPath = undefined
 export let config = undefined
@@ -27,8 +31,9 @@ export let publicDbs = new CaseInsensitiveMap()
 export let privateDbs = new CaseInsensitiveMap()
 
 export async function setup ({configDir, hyperspaceHost, hyperspaceStorage, simulateHyperspace}) {
-  await hyperspace.setup({hyperspaceHost, hyperspaceStorage, simulateHyperspace})
+  await hyperspace.setup({configDir, hyperspaceHost, hyperspaceStorage, simulateHyperspace})
   await schemas.setup()
+  diskusageTracker.setup()
   
   _configDir = configDir
   configPath = path.join(configDir, 'dbconfig.json')
@@ -48,8 +53,11 @@ export async function setup ({configDir, hyperspaceHost, hyperspaceStorage, simu
 
   views.setup()
   await loadMemberUserDbs()
-  await loadOrUnloadExternalUserDbs()
+  await loadOrUnloadExternalUserDbsDebounced()
   /* dont await */ catchupAllIndexes()
+
+  const sweepInterval = setInterval(sweepInactiveDbs, SWEEP_INACTIVE_DBS_INTERVAL)
+  sweepInterval.unref()
 }
 
 export async function createUser ({type, username, email, password, profile}) {
@@ -89,7 +97,7 @@ export async function createUser ({type, username, email, password, profile}) {
       publicDb = new PublicCitizenDB(userId, null)
       await publicDb.setup()
       publicDb.watch(onDatabaseChange)
-      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
+      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
       await catchupIndexes(publicDb)
       user.dbUrl = publicDb.url
 
@@ -101,7 +109,7 @@ export async function createUser ({type, username, email, password, profile}) {
       publicDb = new PublicCommunityDB(userId, null)
       await publicDb.setup()
       publicDb.watch(onDatabaseChange)
-      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
+      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
       user.dbUrl = publicDb.url
     }
 
@@ -113,7 +121,7 @@ export async function createUser ({type, username, email, password, profile}) {
     publicDbs.set(userId, publicDb)
     if (privateDb) {
       privateDbs.set(userId, privateDb)
-      privateDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
+      privateDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
     }
     return {privateDb, publicDb, userId}
   } finally {
@@ -129,11 +137,11 @@ export async function deleteUser (username) {
       if (publicDbs.get(userId).dbType === 'ctzn.network/public-server-db') {
         throw new Error('Cannot delete server database')
       }
-      await publicDbs.get(userId).teardown()
+      await publicDbs.get(userId).teardown({unswarm: true})
       publicDbs.delete(userId)
     }
     if (privateDbs.has(userId)) {
-      await privateDbs.get(userId).teardown()
+      await privateDbs.get(userId).teardown({unswarm: true})
       privateDbs.delete(userId)
     }
     await publicServerDb.users.del(username)
@@ -192,39 +200,47 @@ async function loadMemberUserDbs () {
   let numLoaded = 0
   let users = await publicServerDb.users.list()
   await Promise.allSettled(users.map(async (user) => {
-    if (user.value.type === 'citizen') {
-      const userId = constructUserId(user.key)
-      if (publicDbs.has(userId)) {
-        console.error('Skipping db load due to duplicate userId', userId)
-        return
-      }
-      let publicDb = new PublicCitizenDB(userId, hyperUrlToKey(user.value.dbUrl))
-      await publicDb.setup()
-      publicDbs.set(userId, publicDb)
-      publicDb.watch(onDatabaseChange)
-      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
+    try {
+      if (user.value.type === 'citizen') {
+        const userId = constructUserId(user.key)
+        if (publicDbs.has(userId)) {
+          console.error('Skipping db load due to duplicate userId', userId)
+          return
+        }
+        let publicDb = new PublicCitizenDB(userId, hyperUrlToKey(user.value.dbUrl))
+        await publicDb.setup()
+        publicDbs.set(userId, publicDb)
+        publicDb.watch(onDatabaseChange)
+        publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
 
-      let accountEntry = await privateServerDb.accounts.get(user.value.username)
-      let privateDb = new PrivateCitizenDB(userId, hyperUrlToKey(accountEntry.value.privateDbUrl), publicServerDb, publicDb)
-      await privateDb.setup()
-      privateDbs.set(userId, privateDb)
-      privateDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
+        // DISABLED
+        // we may not use these anymore
+        // -prf
+        // let accountEntry = await privateServerDb.accounts.get(user.value.username)
+        // let privateDb = new PrivateCitizenDB(userId, hyperUrlToKey(accountEntry.value.privateDbUrl), publicServerDb, publicDb)
+        // await privateDb.setup()
+        // privateDbs.set(userId, privateDb)
+        // privateDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
 
-      numLoaded++
-    } else if (user.value.type === 'community') {
-      const userId = constructUserId(user.key)
-      if (publicDbs.has(userId)) {
-        console.error('Skipping db load due to duplicate userId', userId)
-        return
+        numLoaded++
+      } else if (user.value.type === 'community') {
+        const userId = constructUserId(user.key)
+        if (publicDbs.has(userId)) {
+          console.error('Skipping db load due to duplicate userId', userId)
+          return
+        }
+        let publicDb = new PublicCommunityDB(userId, hyperUrlToKey(user.value.dbUrl))
+        await publicDb.setup()
+        publicDbs.set(userId, publicDb)
+        publicDb.watch(onDatabaseChange)
+        publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbsDebounced)
+        numLoaded++
+      } else {
+        issues.add(new UnknownUserTypeIssue(user))
       }
-      let publicDb = new PublicCommunityDB(userId, hyperUrlToKey(user.value.dbUrl))
-      await publicDb.setup()
-      publicDbs.set(userId, publicDb)
-      publicDb.watch(onDatabaseChange)
-      publicDb.on('subscriptions-changed', loadOrUnloadExternalUserDbs)
-      numLoaded++
-    } else {
-      issues.add(new UnknownUserTypeIssue(user))
+    } catch (e) {
+      console.error('Failed to load database for', user.key)
+      console.error(e)
     }
   }))
   console.log('Loaded', numLoaded, 'user DBs (from', users.length, 'member records)')
@@ -301,6 +317,17 @@ export function getDbByUrl (url) {
   }
   for (let db of privateDbs.values()) {
     if (db.url === url) return db
+  }
+}
+
+export function getDbByDkey (dkey) {
+  if (publicServerDb.discoveryKey.toString('hex') === dkey) return publicServerDb
+  if (privateServerDb.discoveryKey.toString('hex') === dkey) return privateServerDb
+  for (let db of publicDbs.values()) {
+    if (db.discoveryKey.toString('hex') === dkey) return db
+  }
+  for (let db of privateDbs.values()) {
+    if (db.discoveryKey.toString('hex') === dkey) return db
   }
 }
 
@@ -414,7 +441,17 @@ async function loadOrUnloadExternalUserDbs () {
     if (userId.endsWith(getDomain()) || externalUserIds.includes(userId)) {
       continue
     }
-    publicDbs.get(userId).teardown()
+    publicDbs.get(userId).teardown({unswarm: true})
     publicDbs.delete(userId)
+  }
+}
+const loadOrUnloadExternalUserDbsDebounced = _debounce(loadOrUnloadExternalUserDbs, 30e3)
+
+async function sweepInactiveDbs () {
+  const ts = Date.now()
+  for (let db of getAllDbs()) {
+    if (db.isEjectableFromMemory(ts)) {
+      await db.teardown({unswarm: false})
+    }
   }
 }

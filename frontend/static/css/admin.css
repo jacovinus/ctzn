@@ -1,0 +1,86 @@
+*:focus {
+  outline: 0;
+}
+input:focus {
+  border-color: rgb(219, 39, 119);
+}
+
+main {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+app-hyperspace-dbs .row > :nth-child(1) {
+  flex: 0 0 200px;
+}
+app-hyperspace-dbs .row > :nth-child(2) {
+  flex: 1;
+}
+app-hyperspace-dbs .row > :nth-child(3) {
+  flex: 0 0 100px;
+}
+app-hyperspace-dbs .row > :nth-child(4) {
+  flex: 0 0 100px;
+}
+app-hyperspace-dbs .row > :nth-child(5) {
+  flex: 0 0 100px;
+}
+
+app-hyperspace-log .row > :nth-child(1) {
+  flex: 0 0 60px;
+}
+app-hyperspace-log .row > :nth-child(2) {
+  flex: 0 0 120px;
+}
+app-hyperspace-log .row > :nth-child(3) {
+  flex: 1;
+}
+app-hyperspace-log .row > :nth-child(4) {
+  flex: 0 0 120px;
+}
+app-hyperspace-log .row > :nth-child(5) {
+  flex: 0 0 100px;
+}
+
+app-users .row > :nth-child(1) {
+  flex: 0 0 200px;
+}
+app-users .row > :nth-child(2) {
+  flex: 1;
+}
+app-users .row > :nth-child(3) {
+  flex: 0 0 100px;
+}
+
+app-issues .row > :nth-child(1) {
+  flex: 1;
+}
+app-issues .row > :nth-child(2) {
+  flex: 0 0 100px;
+}
+
+.arrow-decor {
+  position: relative;
+}
+
+.arrow-decor:before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  width: 8px;
+  height: 8px;
+  transform: rotate(45deg);
+  background: #fff;
+  border-left: 1px solid #ddd;
+  border-top: 1px solid #ddd;
+  left: 50%;
+  bottom: -11px;
+}
+
+.zebra-row:nth-child(even) {
+  background: #f7f7fa;
+}
+
+.zebra-row-hovers:hover {
+  background: rgb(253, 242, 248) !important;
+}

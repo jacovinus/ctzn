@@ -3,7 +3,12 @@ import path from 'path'
 import inspector from 'inspector'
 import { promises as fsp } from 'fs'
 import * as db from '../db/index.js'
+import { log as hyperspaceLog } from '../db/hyperspace.js'
+import { beeShallowList } from '../db/util.js'
+import * as diskusage from '../db/diskusage-tracker.js'
 import * as issues from '../lib/issues.js'
+import * as metrics from '../lib/metrics.js'
+import * as debugLog from '../lib/debug-log.js'
 import { constructUserId } from '../lib/strings.js'
 
 let _inspectorSession
@@ -27,7 +32,7 @@ export function setup (wsServer) {
     });
   })
 
-  wsServer.registerLoopback('server.toggleProfilingCPU', async ([]) => {
+  wsServer.registerAdminOnly('server.toggleProfilingCPU', async ([]) => {
     if (_inspectorSession) {
       return stopProfilingCPU()
     } else {
@@ -45,29 +50,63 @@ export function setup (wsServer) {
     }
   })
 
-  wsServer.registerLoopback('server.listDatabases', async ([]) => {
-    return (
-      [db.publicServerDb, db.privateServerDb]
-      .concat(Array.from(db.publicDbs.values()))
-      .concat(Array.from(db.privateDbs.values()))
-    ).map(db => ({
+  function getDbInfo (db, all = false) {
+    return {
       dbType: db.dbType,
       writable: db.writable,
       key: db.key.toString('hex'),
+      dkey: db.discoveryKey.toString('hex'),
       userId: db.userId,
       isPrivate: db.isPrivate,
       peerCount: db.peers?.length || 0,
+      peers: all ? db.peers : undefined,
       indexers: db.indexers?.map(i => i.schemaId) || [],
-      blobs: db.blobs.feed ? {
-        key: db.blobs.feed.key.toString('hex'),
+      diskusage: diskusage.get(db.discoveryKey.toString('hex')),
+      blobs: db.blobs.feedInfo ? {
+        key: db.blobs.key.toString('hex'),
+        dkey: db.blobs.discoveryKey.toString('hex'),
         writable: db.blobs.writable,
         isPrivate: db.blobs.isPrivate,
-        peerCount: db.blobs.peers?.length || 0
+        peerCount: db.blobs.peers?.length || 0,
+        peers: all ? db.blobs.peers : undefined,
+        diskusage: diskusage.get(db.blobs.discoveryKey.toString('hex'))
       } : undefined
-    }))
+    }
+  }
+
+  wsServer.registerAdminOnly('server.getDatabaseInfo', async ([dkey]) => {
+    const thisDb = db.getDbByDkey(dkey)
+    if (!thisDb) throw new Error('Database not found')
+    return getDbInfo(thisDb, true)
   })
 
-  wsServer.registerLoopback('server.rebuildDatabaseIndexes', async ([userId, indexIds]) => {
+  wsServer.registerAdminOnly('server.listDatabases', async ([]) => {
+    return (
+      Array.from(db.publicDbs.values()).concat(Array.from(db.privateDbs.values()))
+    ).map(db => getDbInfo(db))
+  })
+
+  wsServer.registerAdminOnly('server.beeShallowList', async ([dkey, path]) => {
+    const thisDb = db.getDbByDkey(dkey)
+    if (!thisDb) throw new Error('Database not found')
+    await thisDb.touch()
+    return beeShallowList(thisDb.bee, path)
+  })
+
+  wsServer.registerAdminOnly('server.queryHyperspaceLog', async ([query]) => {
+    return hyperspaceLog.query(entry => {
+      if (query) {
+        for (let k in query) {
+          if (entry[k] !== query[k]) {
+            return false
+          }
+        }
+      }
+      return true
+    })
+  })
+
+  wsServer.registerAdminOnly('server.rebuildDatabaseIndexes', async ([userId, indexIds]) => {
     let targetDb = db.publicDbs.get(userId)
     if (!targetDb && userId === db.publicServerDb.userId) {
       targetDb = db.publicServerDb
@@ -79,7 +118,7 @@ export function setup (wsServer) {
     return targetDb.rebuildIndexes(indexIds)
   })
   
-  wsServer.registerLoopback('server.listIssues', () => {
+  wsServer.registerAdminOnly('server.listIssues', () => {
     return Object.entries(issues.getAll()).map(([id, entries]) => {
       return {
         id,
@@ -93,21 +132,25 @@ export function setup (wsServer) {
     })
   })
 
-  wsServer.registerLoopback('server.recoverIssue', ([issueId]) => {
+  wsServer.registerAdminOnly('server.recoverIssue', ([issueId]) => {
     return issues.recover(issueId)
   })
 
-  wsServer.registerLoopback('server.dismissIssue', ([issueId, opts]) => {
+  wsServer.registerAdminOnly('server.dismissIssue', ([issueId, opts]) => {
     return issues.dismiss(issueId, opts)
   })
 
-  wsServer.registerLoopback('server.listAccounts', async ([]) => {
+  wsServer.registerAdminOnly('server.listAccounts', async ([]) => {
     let userRecords = await db.publicServerDb.users.list()
     return await Promise.all(userRecords.map(async userRecord => {
+      if (!userRecord) return {}
       const userId = constructUserId(userRecord.key)
       const publicDb = db.publicDbs.get(userId)
       const profile = publicDb ? await publicDb.profile.get('self') : undefined
       return {
+        key: publicDb?.key?.toString('hex'),
+        dkey: publicDb?.discoveryKey?.toString('hex'),
+        username: userRecord.key,
         userId,
         type: userRecord.value.type,
         displayName: profile?.value?.displayName || ''
@@ -115,7 +158,27 @@ export function setup (wsServer) {
     }))
   })
 
-  wsServer.registerLoopback('server.listCommunities', async ([]) => {
+  wsServer.registerAdminOnly('server.getAccount', async ([username]) => {
+    let userRecord = await db.publicServerDb.users.get(username)
+    const userId = constructUserId(userRecord.key)
+    const publicDb = db.publicDbs.get(userId)
+    const profile = publicDb ? await publicDb.profile.get('self') : undefined
+    let members
+    if (userRecord.value.type === 'community') {
+      members = await publicDb.members.list()
+    }
+    return {
+      key: publicDb.key.toString('hex'),
+      dkey: publicDb.discoveryKey.toString('hex'),
+      username: userRecord.key,
+      userId,
+      type: userRecord.value.type,
+      profile: profile?.value,
+      members
+    }
+  })
+
+  wsServer.registerAdminOnly('server.listCommunities', async ([]) => {
     let communityDbs = Array.from(db.publicDbs.values()).filter(db => db.dbType === 'ctzn.network/public-community-db')
     return Promise.all(communityDbs.map(async db => {
       let profile = await db.profile.get('self')
@@ -129,7 +192,7 @@ export function setup (wsServer) {
     }))
   })
 
-  wsServer.registerLoopback('server.addCommunityAdmin', async ([communityUserId, adminUserId]) => {
+  wsServer.registerAdminOnly('server.addCommunityAdmin', async ([communityUserId, adminUserId]) => {
     await updateCommunityMemberRole(communityUserId, adminUserId, memberRecordValue => {
       memberRecordValue.roles = memberRecordValue.roles || []
       if (!memberRecordValue.roles.includes('admin')) {
@@ -138,7 +201,7 @@ export function setup (wsServer) {
     })
   })
 
-  wsServer.registerLoopback('server.removeCommunityAdmin', async ([communityUserId, adminUserId]) => {
+  wsServer.registerAdminOnly('server.removeCommunityAdmin', async ([communityUserId, adminUserId]) => {
     await updateCommunityMemberRole(communityUserId, adminUserId, memberRecordValue => {
       memberRecordValue.roles = memberRecordValue.roles || []
       if (memberRecordValue.roles.includes('admin')) {
@@ -147,8 +210,53 @@ export function setup (wsServer) {
     })
   })
 
-  wsServer.registerLoopback('server.removeUser', async ([username]) => {
+  wsServer.registerAdminOnly('server.removeUser', async ([username]) => {
     await db.deleteUser(username)
+  })
+
+  wsServer.registerAdminOnly('server.listMetricsEvents', async ([opts]) => {
+    return metrics.listEvents(opts)
+  })
+
+  wsServer.registerAdminOnly('server.countMetricsEvents', async ([opts]) => {
+    return metrics.countEvents(opts)
+  })
+
+  wsServer.registerAdminOnly('server.countMultipleMetricsEvents', async ([opts]) => {
+    return metrics.countMultipleEvents(opts)
+  })
+
+  wsServer.registerAdminOnly('server.countMultipleMetricsEventsOverTime', async ([opts]) => {
+    return metrics.countMultipleEventsOverTime(opts)
+  })
+
+  wsServer.registerAdminOnly('server.aggregateHttpHits', async ([opts]) => {
+    return metrics.aggregateHttpHits(opts)
+  })
+
+  wsServer.registerAdminOnly('server.countUsers', async ([]) => {
+    let userRecords = await db.publicServerDb.users.list()
+    return userRecords.filter(u => u.value.type === 'citizen').length
+  })
+
+  wsServer.registerAdminOnly('server.isDebuggerEnabled', async ([]) => {
+    return debugLog.debugLog.isEnabled()
+  })
+  
+  wsServer.registerAdminOnly('server.setDebuggerEnabled', async ([b]) => {
+    if (b) {
+      return debugLog.debugLog.enable()
+    } else {
+      return debugLog.debugLog.disable()
+    }
+  })
+
+  wsServer.registerAdminOnly('server.clearDebuggerLog', async ([b]) => {
+    return debugLog.reset()
+  })
+
+  wsServer.registerAdminOnly('server.fetchAndClearDebugLog', async ([]) => {
+    return debugLog.fetchAndClear()
   })
 }
 

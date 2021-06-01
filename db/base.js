@@ -1,8 +1,9 @@
 import EventEmitter from 'events'
 import _debounce from 'lodash.debounce'
-import { client } from './hyperspace.js'
+import { client, log as hyperspaceLog } from './hyperspace.js'
 import Hyperbee from 'hyperbee'
 import * as schemas from '../lib/schemas.js'
+import pumpify from 'pumpify'
 import pump from 'pump'
 import concat from 'concat-stream'
 import through2 from 'through2'
@@ -12,6 +13,7 @@ import dbmethods from './dbmethods.js'
 import lock from '../lib/lock.js'
 import * as perf from '../lib/perf.js'
 import * as issues from '../lib/issues.js'
+import { debugLog } from '../lib/debug-log.js'
 import { ValidationError } from '../lib/errors.js'
 import { constructEntryUrl } from '../lib/strings.js'
 import { DbIndexingIssue } from '../lib/issues/db-indexing.js'
@@ -19,8 +21,10 @@ import { DbmethodBadResponse } from '../lib/issues/dbmethod-bad-response.js'
 
 const FIRST_HYPERBEE_BLOCK = 2
 const READ_TIMEOUT = 10e3
+const UPDATE_CHECK_INTERVAL = 60e3
 const BACKGROUND_INDEXING_DELAY = 5e3 // how much time is allowed to pass before globally indexing an update
 const BLOB_CHUNK_SIZE = bytes('64kb')
+const KEEP_IN_MEMORY_TTL = 15e3
 
 const dbDescription = schemas.createValidator({
   type: 'object',
@@ -55,11 +59,21 @@ export class BaseHyperbeeDB extends EventEmitter {
     this.desc = undefined
     this.key = key || null
     this.bee = null
+    this.beeInfo = {writable: undefined, discoveryKey: undefined}
     this.blobs = new Blobs(this, {isPrivate})
     this.tables = {}
     this.indexers = []
     this.dbmethods = {}
-    this.lock = (id = '') => lock(`${this.key.toString('hex')}:${id}`)
+    this.lastAccess = 0
+    this.lock = (id = '') => lock(`${this.key?.toString('hex') || 'newdb'}:${id}`)
+  }
+
+  get isInMemory () {
+    return !!this.bee
+  }
+
+  isEjectableFromMemory (ts) {
+    return this.isInMemory && this.lastAccess + KEEP_IN_MEMORY_TTL < ts
   }
 
   get dbType () {
@@ -71,68 +85,106 @@ export class BaseHyperbeeDB extends EventEmitter {
   }
 
   get writable () {
-    return this.bee?.feed?.writable
+    return this.beeInfo?.writable
   }
 
   get peers () {
-    return this.bee?.feed?.peers
+    return this.bee?.feed?.peers || []
   }
 
   get url () {
     return `hyper://${this.key.toString('hex')}/`
   }
 
+  get discoveryKey () {
+    return this.beeInfo?.discoveryKey
+  }
+
   async setup () {
-    this.bee = new Hyperbee(client.corestore().get(this.key), {
-      keyEncoding: 'utf8',
-      valueEncoding: 'json'
-    })
-    await this.bee.ready()
-    if (!this.isPrivate) {
-      client.replicate(this.bee.feed)
-    }
-
-    if (!this.bee.feed.writable) {
-      this._eagerUpdate()
-    }
-
-    if (!this.key) {
-      this.key = this.bee.feed.key
-      await this.updateDesc()
-      this.onDatabaseCreated()
-    }
-
-    const desc = await this.bee.get('_db', {timeout: READ_TIMEOUT})
-    if (desc) {
-      dbDescription.assert(desc.value)
-      this.desc = desc.value
-    } else {
-      this.desc = {
-        blobsFeedKey: null
+    debugLog.dbCall('setup', this._ident)
+    const release = await this.lock('setup') // lock to handle multiple setup() calls
+    try {
+      if (this.bee) {
+        return // already loaded
       }
-    }
 
-    this.dbmethodCalls = this.getTable('ctzn.network/dbmethod-call')
-    this.dbmethodResults = this.getTable('ctzn.network/dbmethod-result')
-    this.dbmethodResultsChronIdx = this.getTable('ctzn.network/dbmethod-result-chron-idx')
-    if (this.writable) {
-      for (let method of this.supportedMethods) {
-        this.createDbMethod(`ctzn.network/${method}-method`, dbmethods[method])
+      this.lastAccess = Date.now()
+      this.bee = new Hyperbee(client.corestore().get(this.key), {
+        keyEncoding: 'utf8',
+        valueEncoding: 'json'
+      })
+      debugLog.dbCall('bee.ready', this._ident)
+      await this.bee.ready()
+      this.beeInfo = {writable: this.bee.feed.writable, discoveryKey: this.bee.feed.discoveryKey}
+      if (!this.isPrivate) {
+        client.replicate(this.bee.feed)
       }
+
+      if (!this.bee.feed.writable) {
+        this._eagerUpdate()
+      }
+
+      if (!this.key) {
+        hyperspaceLog.createBee(this.discoveryKey.toString('hex'))
+        this.key = this.bee.feed.key
+        await this.updateDesc()
+        this.onDatabaseCreated()
+      }
+      hyperspaceLog.loadBee(this.discoveryKey.toString('hex'))
+      hyperspaceLog.trackBee(this.bee.feed)
+
+      const desc = await this.bee.get('_db', {timeout: READ_TIMEOUT})
+      debugLog.dbCall('bee.get', this._ident, undefined, '_db')
+      if (desc) {
+        dbDescription.assert(desc.value)
+        this.desc = desc.value
+      } else {
+        this.desc = {
+          blobsFeedKey: null
+        }
+      }
+
+      this.dbmethodCalls = this.getTable('ctzn.network/dbmethod-call')
+      this.dbmethodResults = this.getTable('ctzn.network/dbmethod-result')
+      this.dbmethodResultsChronIdx = this.getTable('ctzn.network/dbmethod-result-chron-idx')
+      if (this.writable) {
+        for (let method of this.supportedMethods) {
+          this.createDbMethod(`ctzn.network/${method}-method`, dbmethods[method])
+        }
+      }
+    } finally {
+      release()
     }
   }
 
-  async teardown () {
-    if (this.blobs) await this.blobs.teardown()
-    this.blobs = undefined
-    if (!this.isPrivate) {
-      client.network.configure(this.bee.feed, {announce: false, lookup: false})
+  async teardown ({unswarm} = {unswarm: false}) {
+    const release = await this.lock('teardown') // lock to handle multiple teardown() calls
+    debugLog.dbCall('teardown', this._ident)
+    try {
+      if (!this.isInMemory) return
+      if (this.blobs) await this.blobs.teardown({unswarm})
+      for (let schemaId in this.tables) {
+        this.tables[schemaId].teardown()
+      }
+      if (!this.isPrivate && unswarm) {
+        client.network.configure(this.bee.feed, {announce: false, lookup: false})
+      }
+      await this.bee.feed.close()
+      this.bee = undefined
+    } finally {
+      release()
     }
-    await this.bee.feed.close()
-    this.bee = undefined
+  }
+
+  async touch () {
+    this.lastAccess = Date.now()
+    if (!this.isInMemory) {
+      await this.setup()
+    }
   }
 
   async updateDesc (updates) {
+    await this.touch()
     this.desc = this.desc || {}
     if (updates) {
       for (let k in updates) {
@@ -141,6 +193,7 @@ export class BaseHyperbeeDB extends EventEmitter {
     }
     this.desc.dbType = this.dbType
     dbDescription.assert(this.desc)
+    debugLog.dbCall('bee.put', this._ident, undefined, '_db')
     await this.bee.put('_db', this.desc)
   }
 
@@ -148,22 +201,29 @@ export class BaseHyperbeeDB extends EventEmitter {
   }
 
   async whenSynced () {
+    debugLog.dbCall('whenSynced', this._ident)
     if (!this.bee.feed.writable) {
+      await this.touch()
       const pend = perf.measure('whenSynced')
+      debugLog.dbCall('feed.update', this._ident)
       await this.bee.feed.update({ifAvailable: true}).catch(e => undefined)
       pend()
     }
   }
 
   watch (_cb) {
+    debugLog.dbCall('watch', this._ident)
+    if (!this.isInMemory) return
     const cb = _debounce(() => _cb(this), BACKGROUND_INDEXING_DELAY, {trailing: true})
     this.bee.feed.on('append', () => cb())
   }
 
   async _eagerUpdate () {
-    if (!this.bee) return
-    await this.bee.feed.update({ifAvailable: false}).catch(e => undefined)
-    this._eagerUpdate()
+    if (this.bee) {
+      debugLog.dbCall('feed.update', this._ident)
+      await this.bee.feed.update({ifAvailable: false}).catch(e => undefined)
+    }
+    setTimeout(() => this._eagerUpdate(), UPDATE_CHECK_INTERVAL).unref()
   }
 
   getTable (schemaId) {
@@ -200,6 +260,8 @@ export class BaseHyperbeeDB extends EventEmitter {
 
   async rebuildIndexes (indexIds = undefined) {
     if (!this.key || !this.writable) return
+    debugLog.dbCall('rebuildIndexes', this._ident)
+    await this.touch()
     console.log('Rebuilding', indexIds ? `indexes: ${indexIds.join(', ')}` : 'all indexes of', this._ident)
     const release = await this.lockAllIndexes()
     try {
@@ -228,6 +290,9 @@ export class BaseHyperbeeDB extends EventEmitter {
   async updateIndexes ({changedDb}) {
     if (!this.key || !this.writable) return
     const release = await this.lock(`update-indexes:${changedDb.url}`)
+    
+    await this.touch()
+    debugLog.updateIndexes(this._ident, changedDb._ident)
 
     const batch = this.bee.batch()
     try {
@@ -235,6 +300,9 @@ export class BaseHyperbeeDB extends EventEmitter {
       for (let i = 0; i < this.indexers.length; i++) {
         const indexer = this.indexers[i]
         const indexState = indexStates[i]
+
+        await changedDb.touch()
+
         let start = indexState?.value?.subject?.lastIndexedSeq || FIRST_HYPERBEE_BLOCK
         if (start === changedDb.bee.version) continue
 
@@ -289,6 +357,7 @@ export class BaseHyperbeeDB extends EventEmitter {
         }
         await indexer.updateState(batch, changedDb.url, changedDb.bee.version)
       }
+      debugLog.dbCall('batch.flush', this._ident)
       await batch.flush()
     } finally {
       release()
@@ -299,32 +368,58 @@ export class BaseHyperbeeDB extends EventEmitter {
 class Blobs {
   constructor (db, {isPrivate}) {
     this.db = db
-    this.kv = undefined
+    this._kv = undefined
     this.feed = undefined
+    this.feedInfo = undefined
     this.isPrivate = isPrivate
   }
 
   get writable () {
-    return this.feed?.writable
+    return this.feedInfo?.writable
   }
 
   get peers () {
-    return this.feed?.peers
+    return this.feed?.peers || []
+  }
+
+  get key () {
+    return this.feedInfo?.key
+  }
+
+  get discoveryKey () {
+    return this.feedInfo?.discoveryKey
+  }
+
+  get kv () {
+    if (!this._kv || this._kv.feed !== this.db.bee?.feed) {
+      // bee was unloaded since last cache, recreate from current bee
+      this._kv = this.db.bee.sub('_blobs')
+    }
+    return this._kv
   }
 
   async setup () {
-    this.kv = this.db.bee.sub('_blobs')
-
+    if (this.feed) {
+      return // already setup
+    }
+    debugLog.dbCall('setup', this.db._ident, 'blobs')
     if (!this.db.desc.blobsFeedKey) {
       this.feed = client.corestore().get(null)
       await this.feed.ready()
+      debugLog.dbCall('feed.ready', this.db._ident, 'blobs')
+      this.feedInfo = {writable: this.feed.writable, key: this.feed.key, discoveryKey: this.feed.discoveryKey}
       await this.db.updateDesc({
         blobsFeedKey: this.feed.key.toString('hex')
       })
+      hyperspaceLog.createCore(this.discoveryKey.toString('hex'))
     } else {
       this.feed = client.corestore().get(Buffer.from(this.db.desc.blobsFeedKey, 'hex'))
       await this.feed.ready()
+      debugLog.dbCall('feed.ready', this.db._ident, 'blobs')
+      this.feedInfo = {writable: this.feed.writable, key: this.feed.key, discoveryKey: this.feed.discoveryKey}
     }
+    hyperspaceLog.loadCore(this.discoveryKey.toString('hex'))
+    hyperspaceLog.trackCore(this.feed)
     if (!this.isPrivate) {
       client.replicate(this.feed)
     }
@@ -332,25 +427,35 @@ class Blobs {
     // TODO track which ranges in the feed are actively pointed to and cache/decache accordingly
   }
 
-  async teardown () {
+  async teardown ({unswarm} = {unswarm: false}) {
     if (!this.feed) return
-    if (!this.isPrivate) {
+    debugLog.dbCall('teardown', this.db._ident, 'blobs')
+    if (!this.isPrivate && unswarm) {
       client.network.configure(this.feed, {announce: false, lookup: false})
     }
+    debugLog.dbCall('feed.close', this.db._ident, 'blobs')
     await this.feed.close()
+    this.feed = undefined
   }
 
   async getPointer (key) {
+    debugLog.dbCall('getPointer', this.db._ident, 'blobs', key)
+    await this.db.touch()
     const pointer = await this.kv.get(key, {timeout: READ_TIMEOUT})
+    debugLog.dbCall('bee.get', this.db._ident, 'blobs', key)
     if (!pointer) throw new Error('Blob not found')
     blobPointer.assert(pointer.value)
     return pointer.value
   }
 
   async createReadStream (key) {
+    debugLog.dbCall('createReadStream', this.db._ident, 'blobs', key)
+    await this.db.touch()
     const pointer = await this.kv.get(key, {timeout: READ_TIMEOUT})
+    debugLog.dbCall('bee.get', this.db._ident, 'blobs', key)
     if (!pointer) throw new Error('Blob not found')
     blobPointer.assert(pointer.value)
+    debugLog.dbCall('feed.createReadStream', this.db._ident, 'blobs')
     return this.feed.createReadStream({
       start: pointer.value.start,
       end: pointer.value.end,
@@ -359,6 +464,8 @@ class Blobs {
   }
 
   async get (key, encoding = undefined) {
+    debugLog.dbCall('get', this.db._ident, 'blobs', key)
+    // no need to touch() because getPointer() does it
     const ptr = await this.getPointer(key)
     const stream = await this.createReadStreamFromPointer(ptr)
     return new Promise((resolve, reject) => {
@@ -376,6 +483,7 @@ class Blobs {
   }
 
   async createReadStreamFromPointer (pointer) {
+    await this.db.touch()
     return this.feed.createReadStream({
       start: pointer.start,
       end: pointer.end,
@@ -384,10 +492,14 @@ class Blobs {
   }
 
   async put (key, buf, {mimeType} = {mimeType: undefined}) {
+    debugLog.dbCall('put', this.db._ident, 'blobs', key)
+    await this.db.touch()
     const chunks = chunkify(buf, BLOB_CHUNK_SIZE)
+    debugLog.dbCall('feed.append', this.db._ident, 'blobs')
     const start = await this.feed.append(chunks)
     const pointer = {start, end: start + chunks.length, mimeType}
     blobPointer.assert(pointer)
+    debugLog.dbCall('bee.put', this.db._ident, 'blobs', key)
     await this.kv.put(key, pointer)
   }
 }
@@ -396,13 +508,24 @@ class Table {
   constructor (db, schema) {
     const [domain, name] = schema.id.split('/')
     this.db = db
-    this.bee = this.db.bee.sub(domain).sub(name)
+    this._bee = undefined
     this.schema = schema
     this._schemaDomain = domain
     this._schemaName = name
     this._onPutCbs = undefined
     this._onDelCbs = undefined
     this.lock = (id = '') => this.db.lock(`${this.schema.id}:${id}`)
+  }
+
+  teardown () {
+  }
+
+  get bee () {
+    if (!this._bee || this._bee.feed !== this.db.bee?.feed) {
+      // bee was unloaded since last cache, recreate from current bee
+      this._bee = this.db.bee.sub(this._schemaDomain).sub(this._schemaName)
+    }
+    return this._bee
   }
 
   constructBeeKey (key) {
@@ -414,7 +537,10 @@ class Table {
   }
 
   async get (key) {
+    debugLog.dbCall('get', this.db._ident, this.schema.id, key)
+    await this.db.touch()
     const pend = perf.measure('table.get')
+    debugLog.dbCall('bee.get', this.db._ident, this.schema.id, key)
     let entry = await this.bee.get(String(key), {timeout: READ_TIMEOUT})
     if (entry) {
       this.schema.assertValid(entry.value)
@@ -424,8 +550,11 @@ class Table {
   }
 
   async put (key, value) {
+    debugLog.dbCall('put', this.db._ident, this.schema.id, key)
+    await this.db.touch()
     const pend = perf.measure('table.put')
     this.schema.assertValid(value)
+    debugLog.dbCall('bee.put', this.db._ident, this.schema.id, key)
     const res = await this.bee.put(String(key), value)
     pend()
     if (this._onPutCbs) {
@@ -435,7 +564,10 @@ class Table {
   }
 
   async del (key) {
+    debugLog.dbCall('del', this.db._ident, this.schema.id, key)
+    await this.db.touch()
     const pend = perf.measure('table.del')
+    debugLog.dbCall('bee.del', this.db._ident, this.schema.id, key)
     const res = await this.bee.del(String(key))
     pend()
     if (this._onDelCbs) {
@@ -444,24 +576,33 @@ class Table {
     return res
   }
 
-  createReadStream (opts) {
+  async createReadStream (opts) {
+    debugLog.dbCall('createReadStream', this.db._ident, this.schema.id)
+    await this.db.touch()
     let _this = this
     opts = opts || {}
     opts.timeout = READ_TIMEOUT
-    return this.bee.createReadStream(opts).pipe(through2.obj(function (entry, enc, cb) {
-      const valid = _this.schema.validate(entry.value)
-      if (valid) this.push(entry)
-      cb()
-    }))
+    debugLog.dbCall('bee.createReadStream', this.db._ident, this.schema.id)
+    return pumpify.obj(
+      this.bee.createReadStream(opts),
+      through2.obj(function (entry, enc, cb) {
+        const valid = _this.schema.validate(entry.value)
+        if (valid) this.push(entry)
+        cb()
+      }
+    ))
   }
 
   async list (opts) {
+    debugLog.dbCall('list', this.db._ident, this.schema.id)
+    // no need to .touch() because createReadStream() does it
     const pend = perf.measure('table.list')
     opts = opts || {}
     opts.timeout = READ_TIMEOUT
+    let stream = await this.createReadStream(opts)
     return new Promise((resolve, reject) => {
       pump(
-        this.createReadStream(opts),
+        stream,
         concat(resolve),
         err => {
           pend()
@@ -471,12 +612,14 @@ class Table {
     })
   }
 
-  scanFind (opts, fn) {
+  async scanFind (opts, fn) {
+    debugLog.dbCall('scanFind', this.db._ident, this.schema.id)
+    // no need to .touch() because createReadStream() does it
+    const rs = await this.createReadStream(opts)
     return new Promise((resolve, reject) => {
       let found = false
       opts = opts || {}
       opts.timeout = READ_TIMEOUT
-      const rs = this.createReadStream(opts)
       rs.on('data', entry => {
         if (found) return
         if (fn(entry)) {
@@ -486,6 +629,7 @@ class Table {
           resolve(entry)
         }
       })
+      rs.on('error', (e) => reject(e))
       rs.on('end', () => {
         if (!found) resolve(undefined)
       })
@@ -493,6 +637,8 @@ class Table {
   }
 
   cursorRead (opts = {}) {
+    debugLog.dbCall('cursorRead', this.db._ident, this.schema.id)
+    // no need to .touch() because list() does it
     let lt = opts.lt
     let atEnd = false
     return {
@@ -500,7 +646,7 @@ class Table {
       db: this.db,
       next: async (n) => {
         if (atEnd) return null
-        let res = await this.list(Object.assign({}, opts, {lt, limit: n}))
+        let res = await this.list(Object.assign({}, opts, {lt, limit: n})).catch(e => [])
         if (res.length === 0) {
           atEnd = true
           return null
@@ -522,6 +668,8 @@ class Table {
   }
 
   async listDiff (other, opts) {
+    debugLog.dbCall('listDiff', this.db._ident, this.schema.id)
+    await this.db.touch()
     const pend = perf.measure('table.listDiff')
     opts = opts || {}
     opts.timeout = READ_TIMEOUT
@@ -542,7 +690,9 @@ class Table {
     //     }
     //   )
     // })
+    debugLog.dbCall('bee.checkout', this.db._ident, this.schema.id, other)
     const co = this.db.bee.checkout(other)
+    debugLog.dbCall('bee.createDiffStream', this.db._ident, this.schema.id)
     const diffs = await new Promise((resolve, reject) => {
       pump(
         co.createDiffStream(this.bee.version),
@@ -622,6 +772,7 @@ class Indexer {
       }
     }
     if (this.schemaId.startsWith('memory:')) return
+    debugLog.dbCall('batch.put', this.db._ident, this.schemaId)
     await batch.put(
       this.db.indexState.constructBeeKey(`${this.schemaId}:${url}`),
       this.indexStatesCache[url].value
@@ -635,6 +786,7 @@ class Indexer {
         lte: `${this.schemaId}:\xff`
       })
       for (let state of states) {
+        debugLog.dbCall('bee.del', this.db._ident, this.schemaId)
         await this.db.indexState.del(state.key)
       }
     }
@@ -653,12 +805,4 @@ function chunkify (buf, chunkSize) {
     buf = buf.slice(chunkSize)
   }
   return chunks
-}
-
-const _debouncers = {}
-function getDebouncedFn (key, fn, wait) {
-  if (!_debouncers[key]) {
-    _debouncers[key] = _debounce(fn, wait)
-  }
-  return _debouncers[key]
 }

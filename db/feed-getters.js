@@ -3,16 +3,34 @@ import { publicDbs } from './index.js'
 import { constructEntryUrl, getServerIdForUserId } from '../lib/strings.js'
 import { dbGet, fetchAuthor, fetchReactions, fetchReplyCount, fetchRelatedItemTransfers, addPrefixToRangeOpts } from './util.js'
 import * as errors from '../lib/errors.js'
+import * as cache from '../lib/cache.js'
+import { debugLog } from '../lib/debug-log.js'
 
 const lexintEncoder = lexint('hex')
 
 export async function listHomeFeed (opts, auth) {
   opts = opts && typeof opts === 'object' ? opts : {}
+  const didSpecifyLt = !!opts.lt
+  const limit = Math.min(opts?.limit || 100, 100)
   opts.lt = opts.lt && typeof opts.lt === 'string' ? opts.lt : lexintEncoder.encode(Date.now())
 
   if (!auth) throw new errors.SessionError()
   const publicDb = publicDbs.get(auth.userId)
   if (!publicDb) throw new errors.NotFoundError('User database not found')
+
+  if (!didSpecifyLt) {
+    let cached = cache.getHomeFeed(auth.userId, limit)
+    if (cached) {
+      debugLog.cacheHit('home-feed', auth.userId)
+      let cachedEntries = opts.limit ? cached.slice(0, limit) : cached
+      for (let entry of cachedEntries) {
+        entry.reactions = (await fetchReactions(entry)).reactions
+        entry.replyCount = await fetchReplyCount(entry)
+        entry.relatedItemTransfers = await fetchRelatedItemTransfers(entry)
+      }
+      return cachedEntries
+    }
+  }
 
   const followEntries = await publicDb.follows.list()
   followEntries.unshift({value: {subject: auth}})
@@ -41,7 +59,6 @@ export async function listHomeFeed (opts, auth) {
 
   const postEntries = []
   const authorsCache = {}
-  const limit = Math.min(opts?.limit || 100, 100)
   const mergedCursor = mergeCursors(cursors)
   for await (let [db, entry] of mergedCursor) {
     if (db.dbType === 'ctzn.network/public-server-db') {
@@ -69,6 +86,10 @@ export async function listHomeFeed (opts, auth) {
     if (postEntries.length >= limit) {
       break
     }
+  }
+
+  if (!didSpecifyLt) {
+    cache.setHomeFeed(auth.userId, postEntries, limit, 60e3)
   }
 
   return postEntries
@@ -117,11 +138,11 @@ export async function listDbmethodFeed (opts, auth) {
 
       db = publicDbs.get(entry.value.database.userId)
       if (!db) continue
-      const result = await db.dbmethodResults.get(entry.value.resultKey, {wait: false})
+      const result = await db.dbmethodResults.get(entry.value.resultKey, {wait: false}).catch(e => undefined)
       if (!result) continue
 
       result.url = constructEntryUrl(db.url, 'ctzn.network/dbmethod-result', entry.value.resultKey)
-      const callRes = await dbGet(result.value.call.dbUrl, {wait: false})
+      const callRes = await dbGet(result.value.call.dbUrl, {wait: false}).catch(e => undefined)
       if (!callRes) continue
       const call = callRes.entry
       call.url = result.value.call.dbUrl
@@ -140,7 +161,7 @@ export async function listDbmethodFeed (opts, auth) {
       const call = entry
       call.url = constructEntryUrl(db.url, 'ctzn.network/dbmethod-call', entry.key)
       const resultUrl = constructEntryUrl(entry.value.database.dbUrl, 'ctzn.network/dbmethod-result', entry.url)
-      const result = (await dbGet(resultUrl, {wait: false}))?.entry
+      const result = (await dbGet(resultUrl, {wait: false}).catch(e => undefined))?.entry
       if (!result) continue
       result.url = resultUrl
       feedEntries.push({

@@ -2,32 +2,39 @@ import lexint from 'lexicographic-integer-encoding'
 import { publicServerDb, publicDbs, loadExternalDb } from '../db/index.js'
 import { constructUserUrl, parseEntryUrl } from '../lib/strings.js'
 import { fetchUserId } from '../lib/network.js'
+import { debugLog } from '../lib/debug-log.js'
 
 const lexintEncoder = lexint('hex')
+const SEP = Buffer.from([0])
+const MIN = SEP
+const MAX = Buffer.from([255])
 
 export async function dbGet (dbUrl, opts = undefined) {
+  debugLog.dbCall('dbGet', undefined, undefined, dbUrl)
   const wait = typeof opts?.wait === 'boolean' ? opts.wait : true
   const urlp = new URL(dbUrl)
   const origin = `hyper://${urlp.hostname}/`
   let userId = await fetchUserId(origin)
   let db = userId ? publicDbs.get(userId) : undefined
   if (!db) {
-    if (!opts.userId) {
+    if (!opts?.userId) {
       throw new Error(`Unable to load ${dbUrl}, user ID not known`)
     }
     if (opts?.noLoadExternal) {
       throw new Error(`Database "${userId}" not found`)
     }
-    db = await loadExternalDb(opts.userId)
+    db = await loadExternalDb(opts?.userId)
     if (!db) {
-      throw new Error(`Database "${opts.userId}" not found`)
+      throw new Error(`Database "${opts?.userId}" not found`)
     }
   }
   const pathParts = urlp.pathname.split('/').filter(Boolean)
+  await db.touch()
   let bee = db.bee
   for (let i = 0; i < pathParts.length - 1; i++) {
     bee = bee.sub(decodeURIComponent(pathParts[i]))
   }
+  debugLog.dbCall('bee.get', db._ident, urlp.pathname)
   return {
     db,
     entry: await bee.get(decodeURIComponent(pathParts[pathParts.length - 1]), {wait})
@@ -35,6 +42,7 @@ export async function dbGet (dbUrl, opts = undefined) {
 }
 
 export async function blobGet (dbId, blobName, opts = undefined) {
+  debugLog.dbCall('blobGet', dbId, undefined, blobName)
   if (typeof opts === 'string') {
     opts = {encoding: opts}
   }
@@ -194,4 +202,64 @@ async function fetchNotification (notificationEntry) {
     },
     item: item?.value
   }
+}
+
+function pathToKey (segments) {
+  var arr = new Array((segments.length * 2) - 1)
+  for (let i = 0; i < segments.length; i++) {
+    arr[i * 2] = Buffer.from(segments[i], 'utf8')
+    if (i < segments.length - 1) arr[i * 2 + 1] = SEP
+  }
+  return Buffer.concat(arr)
+}
+
+function keyToPath (key, asArray = false) {
+  var start = 0
+  var arr = []
+  for (let i = 0; i < key.length; i++) {
+    if (key[i] === 0) {
+      arr.push(key.slice(start, i).toString('utf8'))
+      start = i + 1
+    }
+  }
+  if (start < key.length) {
+    arr.push(key.slice(start).toString('utf8'))
+  }
+  return asArray ? arr : arr.join('/')
+}
+
+function isArrayEqual (a, b) {
+  if (a?.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+export async function beeShallowList (bee, path) {
+  if (typeof path === 'string') {
+    path = path.split('/').filter(Boolean)
+  }
+
+  var arr = []
+  var pathlen = path && path.length > 0 ? path.length : 0
+  var bot = pathlen > 0 ? Buffer.concat([pathToKey(path), SEP, MIN]) : MIN
+  var top = pathlen > 0 ? Buffer.concat([pathToKey(path), SEP, MAX]) : MAX
+  do {
+    let item = await bee.peek({gt: bot, lt: top})
+    if (!item) return arr
+
+    let itemPath = keyToPath(Buffer.from(item.key, 'utf8'), true)
+    if (itemPath.length > pathlen + 1) {
+      let containerPath = itemPath.slice(0, pathlen + 1)
+      if (arr.length && isArrayEqual(containerPath, arr[arr.length - 1].path)) {
+        return arr
+      }
+      arr.push({path: containerPath, isContainer: true})
+      bot = Buffer.concat([pathToKey(containerPath), SEP, MAX])
+    } else {
+      arr.push({path: itemPath, isContainer: false, value: item.value})
+      bot = pathToKey(itemPath)
+    }
+  } while (true)
 }

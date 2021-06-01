@@ -1,23 +1,29 @@
+import { RateLimiter } from 'pauls-sliding-window-rate-limiter'
 import * as http from 'http'
 import express from 'express'
 import { Server as WebSocketServer } from 'rpc-websockets'
 import cors from 'cors'
+import pump from 'pump'
 import { Config } from './lib/config.js'
 import * as db from './db/index.js'
 import * as dbViews from './db/views.js'
 import * as api from './api/index.js'
 import * as perf from './lib/perf.js'
+import * as metrics from './lib/metrics.js'
 import { NoTermsOfServiceIssue } from './lib/issues/no-terms-of-service.js'
 import { NoPrivacyPolicyIssue } from './lib/issues/no-privacy-policy.js'
 import * as issues from './lib/issues.js'
 import * as email from './lib/email.js'
+import { debugLog } from './lib/debug-log.js'
 import * as path from 'path'
 import * as fs from 'fs'
 import { fileURLToPath } from 'url'
 import * as os from 'os'
 import { setOrigin, getDomain, parseAcctUrl, usernameToUserId, DEBUG_MODE_PORTS_MAP } from './lib/strings.js'
+import { Liquid } from 'liquidjs'
 
-const PACKAGE_JSON_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json')
+const INSTALL_PATH = path.dirname(fileURLToPath(import.meta.url))
+const PACKAGE_JSON_PATH = path.join(INSTALL_PATH, 'package.json')
 const PACKAGE_JSON = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, 'utf8'))
 
 let app
@@ -32,6 +38,7 @@ export async function start (opts) {
   if (config.benchmarkMode) {
     perf.enable()
   }
+  metrics.setup({configDir: opts.configDir})
   if (config.debugMode && DEBUG_MODE_PORTS_MAP[config.domain]) {
     config.overrides.port = DEBUG_MODE_PORTS_MAP[config.domain]
   }
@@ -40,23 +47,53 @@ export async function start (opts) {
   const PRIVACY_POLICY_PATH = path.join(opts.configDir, 'privacy-policy.txt')
 
   app = express()
-  app.set('views', path.join(path.dirname(fileURLToPath(import.meta.url)), 'views'))
-  app.set('view engine', 'ejs')
+  app.engine('liquid', (new Liquid()).express())
+  app.set('views', path.join(path.dirname(fileURLToPath(import.meta.url)), 'frontend', 'views'))
+  app.set('view engine', 'liquid')
+  app.set('trust proxy', 'loopback')
   app.use(cors())
 
-  app.get('/', (req, res) => {
-    res.render('index')
+  const rl = new RateLimiter({
+    limit: 300,
+    window: 60e3
+  })
+  app.use((req, res, next) => {
+    metrics.httpRequest({path: req.url})
+    if (!rl.hit(req.ip)) {
+      return res.status(429).json({
+        error: 'RateLimitError',
+        message: 'Rate limit exceeded'
+      })
+    }
+    next()
   })
 
-  app.use('/img', express.static('static/img'))
-  app.use('/css', express.static('static/css'))
-  app.use('/js', express.static('static/js'))
-  app.use('/vendor', express.static('static/vendor'))
-  app.use('/webfonts', express.static('static/webfonts'))
+  app.get('/', (req, res) => res.render('index'))
+
+  app.use('/admin', (req, res, next) => {
+    res.locals.issueCount = issues.count()
+    next()
+  })
+  app.get('/admin', (req, res) => res.render('admin/index', {topnav: 'dashboard'}))
+  app.get('/admin/hyperspace', (req, res) => res.render('admin/hyperspace', {topnav: 'hyperspace'}))
+  app.get('/admin/hyperspace/log', (req, res) => res.render('admin/hyperspace-log', {topnav: 'hyperspace'}))
+  app.get('/admin/hyperspace/db/:id', (req, res) => res.render('admin/hyperspace-view-db', {topnav: 'hyperspace'}))
+  app.get('/admin/issues', (req, res) => res.render('admin/issues', {topnav: 'issues'}))
+  app.get('/admin/issues/view/:id', (req, res) => res.render('admin/issue-view', {topnav: 'issues', id: req.params.id}))
+  app.get('/admin/users', (req, res) => res.render('admin/users', {topnav: 'users'}))
+  app.get('/admin/users/view/:username', (req, res) => res.render('admin/user-view', {topnav: 'users', username: req.params.username}))
+  app.get('/admin/debug', (req, res) => res.render('admin/debug', {topnav: 'debug'}))
+
+  app.use('/img', express.static(path.join(INSTALL_PATH, 'frontend/static/img')))
+  app.use('/css', express.static(path.join(INSTALL_PATH, 'frontend/static/css')))
+  app.use('/js', express.static(path.join(INSTALL_PATH, 'frontend/static/js')))
+  app.use('/vendor', express.static(path.join(INSTALL_PATH, 'frontend/static/vendor')))
+  app.use('/webfonts', express.static(path.join(INSTALL_PATH, 'frontend/static/webfonts')))
   app.use('/_schemas', express.static('schemas'))
 
   app.get('/.well-known/webfinger', async (req, res) => {
     try {
+      debugLog.httpCall('webfinger', req.ip, req.params, req.query)
       if (!req.query.resource) throw new Error('?resource is required')
       const {username, domain} = parseAcctUrl(req.query.resource)
       if (domain !== getDomain()) throw 'Not found'
@@ -79,6 +116,7 @@ export async function start (opts) {
 
   app.get('/.table/:username([^\/]{3,})/:schemaNs/:schemaName', async (req, res) => {
     try {
+      debugLog.httpCall('table.list', req.ip, req.params, req.query)
       const db = getDb(req.params.username)
       const schemaId = `${req.params.schemaNs}/${req.params.schemaName}`
       const table = db.tables[schemaId]
@@ -96,6 +134,7 @@ export async function start (opts) {
 
   app.get('/.table/:username([^\/]{3,})/:schemaNs/:schemaName/:key', async (req, res) => {
     try {
+      debugLog.httpCall('table.get', req.ip, req.params, req.query)
       const db = getDb(req.params.username)
       const table = db.tables[`${req.params.schemaNs}/${req.params.schemaName}`]
       if (!table) throw new Error('Table not found')
@@ -112,6 +151,7 @@ export async function start (opts) {
 
   async function serveView (req, res) {
     try {
+      debugLog.httpCall('view.get', req.ip, req.params, req.query)
       const schemaId = `${req.params.viewns}/${req.params.viewname}`
       const path = req.url.split('?')[0]
       const args = path.split('/').filter(Boolean).slice(3).map(v => decodeURIComponent(v))
@@ -124,7 +164,7 @@ export async function start (opts) {
         res.setHeader('ETag', etag)
         if (mimeType) res.setHeader('Content-Type', mimeType)
         res.setHeader('Content-Security-Policy', `default-src 'none'; sandbox;`)
-        ;(await createStream()).pipe(res)
+        pump(await createStream(), res, () => res.end())
       } else {
         res.setHeader('Content-Security-Policy', `default-src 'none'; sandbox;`)
         res.status(200).json(await dbViews.exec(schemaId, undefined, ...args))
@@ -186,6 +226,7 @@ export async function start (opts) {
   })
   server.listen(config.port, () => {
     console.log(`CTZN server listening at http://localhost:${config.port}`)
+    console.log(`Server admins:`, config.serverAdmins.join(', '))
   })
 
   await email.setup(config)
